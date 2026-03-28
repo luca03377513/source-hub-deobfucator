@@ -1,0 +1,328 @@
+import {
+  Client,
+  GatewayIntentBits,
+  Message,
+  AttachmentBuilder,
+  EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  PermissionFlagsBits,
+} from "discord.js";
+import fetch from "node-fetch";
+import { deobfuscate } from "./deobfuscate.js";
+
+const PREFIX = ".";
+const COOLDOWN_MS = 5000;
+
+if (!process.env.DISCORD_TOKEN) {
+  throw new Error("DISCORD_TOKEN environment variable is required.");
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+  ],
+});
+
+const cooldowns = new Map<string, number>();
+
+function isOnCooldown(userId: string): number {
+  const last = cooldowns.get(userId) ?? 0;
+  const remaining = COOLDOWN_MS - (Date.now() - last);
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+function setCooldown(userId: string): void {
+  cooldowns.set(userId, Date.now());
+}
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("Full tutorial for the Source Hub Deobfuscator bot"),
+  new SlashCommandBuilder()
+    .setName("log")
+    .setDescription("Deobfuscate a Lua script from a URL")
+    .addStringOption((opt) =>
+      opt
+        .setName("url")
+        .setDescription("Link to the script you want to deobfuscate")
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("ping")
+    .setDescription("Check the bot's latency"),
+].map((c) => c.toJSON());
+
+function toRawUrl(url: string): string {
+  try {
+    const u = new URL(url);
+
+    if (u.hostname === "pastebin.com" && !u.pathname.startsWith("/raw")) {
+      return `https://pastebin.com/raw${u.pathname}`;
+    }
+
+    if (u.hostname === "github.com" && u.pathname.includes("/blob/")) {
+      return `https://raw.githubusercontent.com${u.pathname.replace("/blob/", "/")}`;
+    }
+
+    if (
+      (u.hostname === "hastebin.com" || u.hostname === "hst.sh") &&
+      !u.pathname.startsWith("/raw")
+    ) {
+      return `${u.origin}/raw${u.pathname}`;
+    }
+
+    if (u.hostname === "paste.gg") {
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (parts.length >= 2 && !u.pathname.startsWith("/raw")) {
+        return `https://paste.gg/p/${parts[0]}/${parts[1]}/raw`;
+      }
+    }
+  } catch {}
+
+  return url;
+}
+
+function detectObfuscation(source: string): string[] {
+  const found: string[] = [];
+  if (/loadstring\s*\(\s*string\.char\s*\(/.test(source)) found.push("`string.char` encoding");
+  if (/\\x[0-9A-Fa-f]{2}/.test(source)) found.push("hex escapes");
+  if (/\\u[0-9A-Fa-f]{4}/.test(source)) found.push("unicode escapes");
+  if (/atob\s*\(|base64/i.test(source)) found.push("base64");
+  if (/0x[0-9A-Fa-f]+/.test(source)) found.push("hex numbers");
+  return found;
+}
+
+/**
+ * Detect whether a script has been protected by the Source Hub Obfuscator.
+ * Checks for a known watermark/signature that the obfuscator embeds.
+ */
+function isSourceHubProtected(source: string): boolean {
+  return /--\s*protected\s+by\s+source\s*hub/i.test(source) ||
+    /sourcehub[_\s]?obfuscator/i.test(source);
+}
+
+function buildStatsEmbed(original: string, deobfuscated: string): EmbedBuilder {
+  const detections = detectObfuscation(original);
+  const lines = deobfuscated.split("\n").length;
+  const cleanedUp = deobfuscated.length !== original.length;
+
+  return new EmbedBuilder()
+    .setTitle("📊 Script Analysis")
+    .setColor(0x5865f2)
+    .addFields(
+      { name: "📏 Lines", value: lines.toLocaleString(), inline: true },
+      { name: "🔤 Characters", value: deobfuscated.length.toLocaleString(), inline: true },
+      { name: "🔄 Size Change", value: cleanedUp ? `${original.length.toLocaleString()} → ${deobfuscated.length.toLocaleString()}` : "No change", inline: true },
+      {
+        name: "🔓 Obfuscation Detected",
+        value: detections.length > 0 ? detections.join(", ") : "None — script was already clean",
+        inline: false,
+      }
+    )
+    .setFooter({ text: "Source Hub Deobfuscator • lucazzz0967 founder" });
+}
+
+function buildHelpEmbed(): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle("📖 Source Hub Deobfuscator — Full Tutorial")
+    .setColor(0x5865f2)
+    .setDescription("Welcome to **Source Hub Deobfuscator**! Here is everything you need to know to use the bot.")
+    .addFields(
+      {
+        name: "🔍 What does this bot do?",
+        value: "This bot takes a link to any obfuscated or minified script and sends you back the full readable source code. It can break through multiple layers of obfuscation automatically.",
+      },
+      {
+        name: "📌 Commands",
+        value:
+          "**Prefix:** `.log <url>` — deobfuscate a script\n**Slash:** `/log url:<url>` — same via slash\n`.help` / `/help` — show this tutorial\n`.ping` / `/ping` — check bot latency",
+      },
+      {
+        name: "🌐 Supported URL Types",
+        value:
+          "• **Pastebin** — automatically uses the raw version\n• **GitHub** — automatically uses the raw file\n• **Hastebin** — automatically uses the raw version\n• **paste.gg** — automatically uses the raw version\n• **Any direct link** — works as-is",
+      },
+      {
+        name: "🔓 What obfuscation can it bypass?",
+        value:
+          "• `loadstring(string.char(...))()` — full decode (multi-layer)\n• `string.char(...)` — char array decoding\n• Hex strings (`\\x41`)\n• Unicode escapes (`\\u0041`)\n• Base64 (`atob(...)` and similar)\n• Hex numbers (`0xFF`)\n• Multiple layers (up to 10 passes)",
+      },
+      {
+        name: "📥 How to use the result",
+        value: "The bot sends back a `.lua` file alongside a stats embed showing the line count, character count, and what obfuscation was found.",
+      },
+      {
+        name: "⏱️ Cooldown",
+        value: "There is a **5 second cooldown** per user between requests.",
+      },
+      {
+        name: "❓ Need help?",
+        value: "Join our Discord: https://discord.gg/yeFb6bV8",
+      }
+    )
+    .setFooter({ text: "Source Hub Deobfuscator • lucazzz0967 founder" });
+}
+
+async function runLog(
+  url: string,
+  userId: string,
+  sendCooldown: (secs: number) => Promise<unknown>,
+  reply: (content: string) => Promise<unknown>,
+  editReply: (opts: { content?: string; embeds?: EmbedBuilder[]; files?: AttachmentBuilder[] }) => Promise<unknown>
+): Promise<void> {
+  const remaining = isOnCooldown(userId);
+  if (remaining > 0) {
+    await sendCooldown(remaining);
+    return;
+  }
+  setCooldown(userId);
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    await reply("That doesn't look like a valid URL.");
+    return;
+  }
+
+  const rawUrl = toRawUrl(parsedUrl.href);
+  await reply(`Fetching \`${rawUrl}\`...`);
+
+  try {
+    const response = await fetch(rawUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      await editReply({ content: `Failed to fetch the script — HTTP ${response.status}` });
+      return;
+    }
+
+    const source = await response.text();
+
+    if (!source.trim()) {
+      await editReply({ content: "The URL returned empty content." });
+      return;
+    }
+
+    if (isSourceHubProtected(source)) {
+      const protectedEmbed = new EmbedBuilder()
+        .setTitle("🔒 Script Protected")
+        .setDescription("This script has been protected by **Source Hub Obfuscator** and cannot be deobfuscated.")
+        .setColor(0xe74c3c)
+        .addFields({ name: "Want to protect your own scripts?", value: "Use the Source Hub Obfuscator bot with `!obf <url>`" })
+        .setFooter({ text: "Source Hub Deobfuscator • lucazzz0967 founder" });
+      await editReply({ content: "", embeds: [protectedEmbed] });
+      return;
+    }
+
+    const deobfuscated = deobfuscate(source);
+    const header = `-- deobfucated by source hub deobufcator https://discord.gg/yeFb6bV8 -lucazzz0967 founder\n\n`;
+    const buffer = Buffer.from(header + deobfuscated, "utf-8");
+    const attachment = new AttachmentBuilder(buffer, { name: "source.lua" });
+    const statsEmbed = buildStatsEmbed(source, deobfuscated);
+
+    await editReply({
+      content: "",
+      embeds: [statsEmbed],
+      files: [attachment],
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await editReply({ content: `Error: ${msg}` });
+  }
+}
+
+client.once("clientReady", async (c) => {
+  console.log(`Logged in as ${c.user.tag}`);
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN!);
+  try {
+    await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
+    console.log("Slash commands registered globally.");
+  } catch (err) {
+    console.error("Failed to register slash commands:", err);
+  }
+});
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const i = interaction as ChatInputCommandInteraction;
+
+  if (i.commandName === "ping") {
+    const sent = await i.reply({ content: "Pinging...", fetchReply: true });
+    const latency = sent.createdTimestamp - i.createdTimestamp;
+    await i.editReply(`🏓 Pong! Latency: **${latency}ms** | WebSocket: **${client.ws.ping}ms**`);
+    return;
+  }
+
+  if (i.commandName === "help") {
+    await i.reply({ embeds: [buildHelpEmbed()] });
+    return;
+  }
+
+  if (i.commandName === "log") {
+    if (!i.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await i.reply({ content: "🔒 This command is restricted to **administrators** only.", ephemeral: true });
+      return;
+    }
+    const url = i.options.getString("url", true);
+    await i.deferReply();
+    await runLog(
+      url,
+      i.user.id,
+      (secs) => i.editReply({ content: `⏱️ You're on cooldown. Please wait **${secs}s** before using this again.` }),
+      (content) => i.editReply({ content }),
+      (opts) => i.editReply(opts)
+    );
+  }
+});
+
+client.on("messageCreate", async (message: Message) => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith(PREFIX)) return;
+
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const command = args.shift()?.toLowerCase();
+
+  if (command === "ping") {
+    const sent = await message.reply("Pinging...");
+    const latency = sent.createdTimestamp - message.createdTimestamp;
+    await sent.edit(`🏓 Pong! Latency: **${latency}ms** | WebSocket: **${client.ws.ping}ms**`);
+    return;
+  }
+
+  if (command === "help") {
+    await message.reply({ embeds: [buildHelpEmbed()] });
+    return;
+  }
+
+  if (command === "log") {
+    if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+      await message.reply("🔒 This command is restricted to **administrators** only.");
+      return;
+    }
+    const url = args[0];
+    if (!url) {
+      await message.reply("Usage: `.log <url>`");
+      return;
+    }
+    const statusMsg = await message.reply("...");
+    await runLog(
+      url,
+      message.author.id,
+      (secs) => statusMsg.edit(`⏱️ You're on cooldown. Please wait **${secs}s** before using this again.`),
+      (content) => statusMsg.edit(content),
+      (opts) => statusMsg.edit(opts)
+    );
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
