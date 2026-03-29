@@ -2,6 +2,7 @@
   "name": "source-hub-deobfuscator",
   "version": "1.0.0",
   "description": "Discord bot that deobfuscates Lua scripts",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
